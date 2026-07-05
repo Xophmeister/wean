@@ -41,6 +41,8 @@ home-manager.users.YOU.home.packages = with pkgs; [
 ];
 ```
 
+<!-- FIXME This is not correct
+
 ### I don't use NixOS
 
 The script is simple enough to modify for other platforms. I would
@@ -68,9 +70,11 @@ suggest something like this:
    want to wrap:
 
    ```bash
-   ln -s claude /path/to/wean.sh
-   ln -s copilot /path/to/wean.sh
+   ln -s /path/to/wean.sh claude
+   ln -s /path/to/wean.sh copilot
    ```
+
+-->
 
 ## Isn't this trivial to bypass?
 
