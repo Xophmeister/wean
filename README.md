@@ -8,9 +8,9 @@ tools can be useful, but they shouldn't become a crux. So I wrote this
 simple script to seize the means of production!
 
 Rather than disabling these tools altogether, this script wraps them
-with an exponential timeout, resetting each calendar day -- with a
-helpful message to remind you that you should be in control of your own
-work -- before running.
+with an exponential start-up timeout, resetting each calendar day, with
+a helpful message to remind you that you should be in control of your
+own work.
 
 ## Usage
 
@@ -41,40 +41,36 @@ home-manager.users.YOU.home.packages = with pkgs; [
 ];
 ```
 
-<!-- FIXME This is not correct
-
 ### I don't use NixOS
 
-The script is simple enough to modify for other platforms. I would
-suggest something like this:
+I gotchu, bro. The script is simple enough to modify for other
+platforms, but I've included a [wrapper template script] that you can
+use to wrap any binary you want:
 
-1. Copy `wean.sh` to a location in your `$PATH`, which is of higher
-   precedence than the original binary you want to wrap (e.g.,
-   `~/.local/bin/wean.sh`).
+1. Copy `wean.sh` and `wean-wrap-template.sh` to a location in your
+   `$PATH`, which is of higher precedence than the original binary you
+   want to wrap (e.g., `~/.local/bin`) and rename the template script to
+   whatever you like (e.g., `claude`).
 
-2. Modify the `BINARY` variable in `wean.sh` to instead point to `$0`:
+2. Modify the `WEAN` and `WRAP` variables in this copy to point to the
+   path of `wean.sh` and the original binary you want to wrap (e.g.,
+   `/usr/bin/claude`):
 
    ```diff
-   @@ -6,7 +6,7 @@
+   @@ -2,8 +2,8 @@
 
-    set -euo pipefail
+    # wean.sh wrapper template for non-Nix systems
 
-   -readonly BINARY='@BINARY@'
-   +readonly BINARY="$0"
-    readonly STATE="${XDG_STATE_HOME:-${HOME}/.local/state}/wean.json"
+   -readonly WEAN="/path/to/wean.sh"
+   -readonly WRAP="/path/to/wrapped/binary"
+   +readonly WEAN="${HOME}/.local/bin/wean.sh"
+   +readonly WRAP="/usr/bin/claude"
 
-    today() {
+    [[ -x "${WEAN}" ]] || { echo "Error: wean.sh not found at ${WEAN}" >&2; exit 1; }
+    [[ -x "${WRAP}" ]] || { echo "Error: wrapped binary not found at ${WRAP}" >&2; exit 1; }
    ```
 
-3. Alongside the script, create a symlink to the original binary you
-   want to wrap:
-
-   ```bash
-   ln -s /path/to/wean.sh claude
-   ln -s /path/to/wean.sh copilot
-   ```
-
--->
+3. Rinse and repeat for any other binaries you want to wrap.
 
 ## Isn't this trivial to bypass?
 
@@ -90,3 +86,4 @@ habit of re-engaging with your own work.
 [original post]: https://hachyderm.io/@xophmeister/116857208020117822
 [nix]: https://nixos.org
 [home-manager]: https://nix-community.github.io/home-manager
+[wrapper template script]: /wean-wrap-template.sh
