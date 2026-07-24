@@ -79,6 +79,13 @@ circumvent it. The idea is to provide enough friction to make you think
 twice before reaching for agentic AI tools and, hopefully, building a
 habit of re-engaging with your own work.
 
+## Agent instructions
+
+To try to further the point, I've included an example agent instruction
+set to reinforce the idea that you should be in control of your own
+work. Copy [this](/AGENTS.md.eg) wherever your agent of choice looks for
+instructions.
+
 <!-- Links -->
 
 [theory of alienation]: https://en.wikipedia.org/wiki/Marx%27s_theory_of_alienation
