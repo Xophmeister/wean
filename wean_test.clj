@@ -1,3 +1,5 @@
+(ns wean-test)
+
 (require '[clojure.test :as t]
          '[wean :as w])
 
@@ -54,7 +56,3 @@
 
   (t/testing "a clock-skewed session starting in the future never goes negative"
     (t/is (= {:count 1 :duration 0} (w/usage [{:start (+ now (* 5 minute))}] now hour)))))
-
-;; Entrypoint
-(let [{:keys [fail error]} (t/run-tests 'user)]
-  (System/exit (if (pos? (+ fail error)) 1 0)))

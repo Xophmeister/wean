@@ -1,3 +1,8 @@
-;; Development only: puts wean.clj on the classpath so test.clj can require it.
-;; The packaged script requires nothing external, so this is not shipped.
-{:paths ["."]}
+{:paths ["."]
+
+ :tasks
+ {test {:doc "Run the unit tests."
+        :requires ([clojure.test :as t]
+                   [wean-test])
+        :task (let [{:keys [fail error]} (t/run-tests 'wean-test)]
+                (System/exit (if (pos? (+ fail error)) 1 0)))}}}
