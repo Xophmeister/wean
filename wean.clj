@@ -59,7 +59,8 @@
 
 (defn friction
   "Calculate the wait time based on the window usage."
-  [{:keys [count duration]}]
+  ; TODO Take :duration into account too
+  [{:keys [count]}]
 
   ; Legacy formula: 3 + 2^count
   (+ 3 (Math/pow 2 count)))
