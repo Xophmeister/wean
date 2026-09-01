@@ -26,6 +26,8 @@
 (def ^:const default-window     (* 24 60 60 1000))    ; 24 hours
 (def ^:const heartbeat-interval 60000)                ; 1 minute
 
+; Also: State path override, rather than relying on XDG_STATE_HOME
+
 ;; Policy ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; What can be gleaned from the log: the sessions that bear on a decision,
 ; what they add up to and the friction they incur.
@@ -394,14 +396,28 @@
 
              {:inherit true}))
 
+(defn- discover
+  "The first binary in the PATH under the name wean was invoked as,
+  other than wean itself."
+  [me]
+
+  (let [self (fs/real-path me)]
+    (->> (fs/which-all (fs/file-name me))
+         (remove #(= self (fs/real-path %)))
+         first)))
+
 (defn- target
   "The binary wean is supervising, as an absolute path."
-  []
+  [me]
 
-  (or (System/getenv "WEAN_BINARY")
+  (or (System/getenv "WEAN_BINARY")  ; Env var, mostly for Nix...
+      (some-> (discover me) str)     ; ...otherwise, PATH discovery...
 
-      ; TODO Fallback to discovery by invoked name
-      (do (binding [*out* *err*] (println "WEAN_BINARY not set!"))
+      ; ...or die horribly
+      (do (binding [*out* *err*]
+            (println (str "WEAN_BINARY not set, nor "
+                          (fs/file-name me) " found in PATH!")))
+
           (System/exit 1))))
 
 ;; Entrypoint ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -411,7 +427,7 @@
 
 (defn -main [& args]
   (let [path   (str log-file)
-        binary (target)
+        binary (target (System/getProperty "babashka.file"))
         name   (fs/file-name binary)]
 
     (fs/create-dirs (fs/parent path))

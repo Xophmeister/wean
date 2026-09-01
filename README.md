@@ -5,12 +5,12 @@ estrangement from ones own work, per Marx's [Theory of Alienation], and
 are in direct contradiction to Naur's treatise of [Programming as Theory
 Building]. (See my [original post] on this, on Mastodon.) Agentic AI
 tools can be useful, but they shouldn't become a crux. So I wrote this
-simple script to seize the means of production!
+little tool to seize the means of production!
 
 Rather than disabling these tools altogether, this script wraps them
-with an exponential start-up timeout, resetting each calendar day, with
-a helpful message to remind you that you should be in control of your
-own work.
+with a start-up timeout that grows with how much you've used them over
+the last 24 hours, along with a helpful message to remind you that you
+should be in control of your own work.
 
 ## Usage
 
@@ -43,34 +43,41 @@ home-manager.users.YOU.home.packages = with pkgs; [
 
 ### I don't use NixOS
 
-I gotchu, bro. The script is simple enough to modify for other
-platforms, but I've included a [wrapper template script] that you can
-use to wrap any binary you want:
+I gotchu, bro. All you need is [Babashka] on your `$PATH`, plus a
+directory that takes precedence over the binary you want to wrap:
 
-1. Copy `wean.sh` and `wean-wrap-template.sh` to a location in your
-   `$PATH`, which is of higher precedence than the original binary you
-   want to wrap (e.g., `~/.local/bin`) and rename the template script to
-   whatever you like (e.g., `claude`).
+1. Put `wean.clj` somewhere permanent:
 
-2. Modify the `WEAN` and `WRAP` variables in this copy to point to the
-   path of `wean.sh` and the original binary you want to wrap (e.g.,
-   `/usr/bin/claude`):
-
-   ```diff
-   @@ -2,8 +2,8 @@
-
-    # wean.sh wrapper template for non-Nix systems
-
-   -readonly WEAN="/path/to/wean.sh"
-   -readonly WRAP="/path/to/wrapped/binary"
-   +readonly WEAN="${HOME}/.local/bin/wean.sh"
-   +readonly WRAP="/usr/bin/claude"
-
-    [[ -x "${WEAN}" ]] || { echo "Error: wean.sh not found at ${WEAN}" >&2; exit 1; }
-    [[ -x "${WRAP}" ]] || { echo "Error: wrapped binary not found at ${WRAP}" >&2; exit 1; }
+   ```sh
+   install -Dm755 wean.clj ~/.local/share/wean/wean.clj
    ```
 
-3. Rinse and repeat for any other binaries you want to wrap.
+2. Symlink it into a directory that comes _earlier_ in your `$PATH`
+   than the real binary, with that binary's name:
+
+   ```sh
+   ln -s ~/.local/share/wean/wean.clj ~/.local/bin/claude
+   ```
+
+3. Rinse and repeat for anything else you want to wrap: one symlink
+   each, all pointing at the same script.
+
+wean works out what to run from the name it was invoked as. It looks
+along `$PATH` for the next binary of that name which isn't itself, so
+the symlink shadows the real `claude` and wean finds it immediately
+behind. There's nothing to configure per binary.
+
+If that's not what you want -- the real binary isn't on `$PATH`, or you
+want to wrap it under a different name -- set `WEAN_BINARY` to its full
+path and wean will use that instead. That's how the Nix route works:
+the wrapper sets it for you.
+
+## State
+
+wean keeps a log at `$XDG_STATE_HOME/wean/log.edn` -- usually
+`~/.local/state/wean/log.edn` -- with one entry per session per wrapped
+binary, recording when it started and when it ended. Deleting it resets
+the friction to nothing, which segues neatly to...
 
 ## Isn't this trivial to bypass?
 
@@ -93,4 +100,4 @@ instructions.
 [original post]: https://hachyderm.io/@xophmeister/116857208020117822
 [nix]: https://nixos.org
 [home-manager]: https://nix-community.github.io/home-manager
-[wrapper template script]: /wean-wrap-template.sh
+[babashka]: https://babashka.org
