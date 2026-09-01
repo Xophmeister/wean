@@ -16,7 +16,7 @@
       # Everything the QA tasks operate on, so that the checks and the
       # formatter cannot drift apart over which files they cover.
       clojure = "wean.clj wean_test.clj bb.edn";
-      nix = "flake.nix";
+      nix = "flake.nix wean.nix";
 
       # A QA check: run the script against a writeable copy of the
       # sources and, if it succeeds, produce the output the build needs
@@ -55,6 +55,33 @@
         test = qa pkgs "test" [ pkgs.babashka-unwrapped ] ''
           bb test
         '';
+
+        # Build a wrapper and run it. Nothing can be built without
+        # something to wrap, so this is also the only coverage the
+        # packaging gets: it exercises writeBabashkaBin, the lint the
+        # writer runs over the script it installs, the makeWrapper
+        # indirection that supplies WEAN_BINARY and the supervisor
+        # itself.
+        smoke =
+          let
+            wrapped = pkgs.callPackage ./wean.nix {
+              package = pkgs.coreutils;
+              binary = "date";
+            };
+          in
+          pkgs.runCommand "wean-check-smoke" { } ''
+            export XDG_STATE_HOME="$TMPDIR/state"
+
+            ${wrapped}/bin/date -u
+            ${wrapped}/bin/date +%s
+
+            if ${wrapped}/bin/date --nope; then
+              echo "wean did not propagate a failing exit code" >&2
+              exit 1
+            fi
+
+            touch "$out"
+          '';
       });
 
       formatter = forAllSystems (

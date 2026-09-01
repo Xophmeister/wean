@@ -26,9 +26,6 @@
 (def ^:const default-window     (* 24 60 60 1000))    ; 24 hours
 (def ^:const heartbeat-interval 60000)                ; 1 minute
 
-; TODO Replace substitution with discovery
-(def ^:const binary "@BINARY@")
-
 ;; Policy ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; What can be gleaned from the log: the sessions that bear on a decision,
 ; what they add up to and the friction they incur.
@@ -397,14 +394,25 @@
 
              {:inherit true}))
 
+(defn- target
+  "The binary wean is supervising, as an absolute path."
+  []
+
+  (or (System/getenv "WEAN_BINARY")
+
+      ; TODO Fallback to discovery by invoked name
+      (do (binding [*out* *err*] (println "WEAN_BINARY not set!"))
+          (System/exit 1))))
+
 ;; Entrypoint ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (def ^:private log-file
   (fs/path (fs/xdg-state-home "wean") "log.edn"))
 
 (defn -main [& args]
-  (let [path (str log-file)
-        name (fs/file-name binary)]
+  (let [path   (str log-file)
+        binary (target)
+        name   (fs/file-name binary)]
 
     (fs/create-dirs (fs/parent path))
     (signals! nag-signals)
