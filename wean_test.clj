@@ -2,6 +2,7 @@
 
 (require '[babashka.fs :as fs]
          '[babashka.process :as p]
+         '[clojure.edn :as edn]
          '[clojure.test :as t]
          '[wean :as w])
 
@@ -51,6 +52,24 @@
     @proc
     (.pid (:proc proc))))
 
+(def ^:private bb
+  "Babashka's own path, so that a subprocess can still be started under
+  an environment that has no PATH to find it by."
+  (str (fs/which "bb")))
+
+(defn- bb-eval
+  "Evaluate the given code in a fresh babashka process, under exactly
+  the given environment.
+
+  Resolution reads PATH and WEAN_BINARY from the environment, which
+  cannot be changed in place, so these are the only tests that need a
+  process of their own."
+  [env code]
+
+  (let [{:keys [exit out err]} @(p/process [bb "-e" code]
+                                           {:env env :out :string :err :string})]
+    {:exit exit :out out :err err}))
+
 ; Each test gets its own state directory, so that they cannot interfere
 ; through the filesystem and none of them touch the real log.
 (def ^:dynamic *dir* nil)
@@ -99,6 +118,22 @@
   (t/testing "a clock-skewed session starting in the future never goes negative"
     (t/is (= {:count 1 :duration 0} (w/usage [{:start (+ now (* 5 minute))}] now hour)))))
 
+(t/deftest friction-schedule
+  (t/testing "an unused window costs the base wait alone"
+    (t/is (= 4 (w/friction {:count 0 :duration 0}))))
+
+  (t/testing "each further session in the window doubles the wait"
+    (t/is (= [5 7 11 19] (mapv #(w/friction {:count % :duration 0}) [1 2 3 4]))))
+
+  (t/testing "the wait is integral, being both formatted and slept on"
+    ; Math/pow returns a double, and (format "%2d" 5.0) throws
+    (t/is (integer? (w/friction {:count 3 :duration 0}))))
+
+  ; TODO Invert once friction takes time spent into account
+  (t/testing "time spent is deliberately not yet taken into account"
+    (t/is (= (w/friction {:count 1 :duration 0})
+             (w/friction {:count 1 :duration (* 5 hour)})))))
+
 ;; Log ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (t/deftest reaping
@@ -106,7 +141,8 @@
   ; set of live PIDs is a perfectly good liveness predicate.
   (let [before {"claude"  [{:id :live  :pid 1 :start (ago hour)}
                            {:id :gone  :pid 2 :start (ago hour)}
-                           {:id :ended :pid 3 :start (ago hour) :end (ago (* 30 minute))}]
+                           {:id :beat  :pid 3 :start (ago hour) :seen (ago (* 10 minute))}
+                           {:id :ended :pid 4 :start (ago hour) :end (ago (* 30 minute))}]
                 "copilot" [{:id :nopid :start (ago hour)}]}
         after  (w/reap before #{1})]
 
@@ -115,6 +151,12 @@
 
     (t/testing "a session whose process is gone is closed at its own start"
       (t/is (= (ago hour) (:end (session after :gone)))))
+
+    (t/testing "a session with a heartbeat is charged up to its last beat"
+      (t/is (= (ago (* 10 minute)) (:end (session after :beat)))))
+
+    (t/testing "the heartbeat is dropped once an end is known, being redundant"
+      (t/is (not (contains? (session after :beat) :seen))))
 
     (t/testing "a session that already ended is untouched"
       (t/is (= (ago (* 30 minute)) (:end (session after :ended)))))
@@ -156,8 +198,35 @@
     (t/is (= [{:id :c}]
              (get (w/open {"copilot" [{:id :c}]} "claude" {:id :a}) "copilot")))))
 
+(t/deftest touching
+  (let [before {"claude"  [{:id :a    :start (ago hour)}
+                           {:id :b    :start (ago hour)}
+                           {:id :done :start (ago hour) :end (ago (* 30 minute))}]
+                "copilot" [{:id :c    :start (ago hour)}]}]
+
+    (t/testing "the matching session gains a heartbeat"
+      (t/is (= now (:seen (session (w/touch before :a now) :a)))))
+
+    (t/testing "no other session is touched"
+      (t/is (nil? (:seen (session (w/touch before :a now) :b)))))
+
+    (t/testing "sessions are found under any binary"
+      (t/is (= now (:seen (session (w/touch before :c now) :c)))))
+
+    (t/testing "a later heartbeat replaces an earlier one"
+      (t/is (= now (:seen (session (-> before
+                                       (w/touch :a (ago minute))
+                                       (w/touch :a now))
+                                   :a)))))
+
+    (t/testing "a session that has already ended gains no heartbeat"
+      (t/is (nil? (:seen (session (w/touch before :done now) :done)))))
+
+    (t/testing "an unknown ID is ignored"
+      (t/is (= before (w/touch before :nonesuch now))))))
+
 (t/deftest closing
-  (let [before {"claude"  [{:id :a :start (ago hour)}
+  (let [before {"claude"  [{:id :a :start (ago hour) :seen (ago minute)}
                            {:id :b :start (ago hour)}]
                 "copilot" [{:id :c :start (ago hour)}]}]
 
@@ -172,6 +241,9 @@
 
     (t/testing "the first close wins, so a second cannot inflate the duration"
       (t/is (= now (:end (session (-> before (w/close :a now) (w/close :a (+ now hour))) :a)))))
+
+    (t/testing "closing drops the heartbeat, which the :end supersedes"
+      (t/is (not (contains? (session (w/close before :a now) :a) :seen))))
 
     (t/testing "an unknown ID is ignored"
       (t/is (= before (w/close before :nonesuch now))))))
@@ -195,6 +267,11 @@
   (t/testing "a running session is not given an :end by the round trip"
     (w/write-log! {"claude" [{:id :a :pid 1 :start (recently hour)}]} (log-path))
     (t/is (not (contains? (session (w/read-log (log-path)) :a) :end))))
+
+  (t/testing "a heartbeat is stored as an #inst too, not left as a raw count"
+    (w/write-log! {"claude" [{:id :a :pid 1 :start (recently hour) :seen (recently minute)}]}
+                  (log-path))
+    (t/is (inst? (:seen (session (edn/read-string (slurp (log-path))) :a)))))
 
   (t/testing "writing leaves no temporary files behind"
     (w/write-log! {"claude" []} (log-path))
@@ -250,6 +327,48 @@
         (w/close-session! (log-path) id (System/currentTimeMillis))
         (t/is (= ended (:end (session (w/read-log (log-path)) id))))))))
 
+(t/deftest heartbeating
+  (let [id   (w/open-session! (log-path) "claude" (recently (* 5 minute)))
+        beat (recently (* 3 minute))]
+
+    (t/testing "a heartbeat is recorded against the running session"
+      (w/touch-session! (log-path) id beat)
+      (t/is (= beat (:seen (session (w/read-log (log-path)) id)))))
+
+    (t/testing "a heartbeat arriving after the close cannot reopen the session"
+      (w/close-session! (log-path) id (recently minute))
+      (let [closed (session (w/read-log (log-path)) id)]
+        (w/touch-session! (log-path) id (System/currentTimeMillis))
+        (t/is (= closed (session (w/read-log (log-path)) id)))))))
+
+(t/deftest thread-safety
+  (t/testing "simultaneous transactions in one process do not collide"
+    ; The heartbeat runs on a thread of its own, so update-log! must
+    ; tolerate two callers in the same process. A file lock belongs to
+    ; the process rather than to the thread that took it, so without a
+    ; monitor beneath it the second caller gets an
+    ; OverlappingFileLockException rather than its turn.
+    ; The path is resolved here rather than in the workers because
+    ; binding is thread-local: a bare Thread sees *dir*'s root value,
+    ; and fs/path quietly turns a nil parent into a relative path.
+    (let [path    (log-path)
+          threads 4
+          each    25
+          failed  (atom [])
+          workers (doall (for [_ (range threads)]
+                           (Thread.
+                            (fn []
+                              (dotimes [_ each]
+                                (try (w/open-session! path "claude"
+                                                      (System/currentTimeMillis))
+                                     (catch Exception e (swap! failed conj (class e)))))))))]
+
+      (run! #(.start %) workers)
+      (run! #(.join %) workers)
+
+      (t/is (empty? @failed) "every transaction succeeded")
+      (t/is (= (* threads each) (count (get (w/read-log (log-path)) "claude")))))))
+
 (t/deftest concurrency
   (t/testing "simultaneous transactions do not lose one another's updates"
     ; This is the only test that justifies the lock existing: the failure
@@ -262,3 +381,77 @@
 
       (t/is (every? zero? exits) "every appending process exited cleanly")
       (t/is (= n (count (get (w/read-log (log-path)) "claude")))))))
+
+;; Resolution ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defn- executable
+  "Create a trivial executable at the given path, standing in for the
+  binary wean is meant to find."
+  [path]
+
+  (fs/create-dirs (fs/parent path))
+  (spit (fs/file path) "#!/bin/sh\nexit 0\n")
+  (fs/set-posix-file-permissions path "rwxr-xr-x")
+  path)
+
+(defn- shadowed
+  "A PATH in which wean, symlinked as claude, shadows a real claude
+  further along. Returns the directories in order, the symlink and the
+  binary it ought to resolve to."
+  []
+
+  (let [wean (str (fs/real-path "wean.clj"))
+        near (fs/path *dir* "near")
+        far  (fs/path *dir* "far")
+        link (str (fs/path near "claude"))
+        real (str (fs/path far "claude"))]
+
+    (fs/create-dirs near)
+    (executable real)
+    (fs/create-sym-link link wean)
+
+    {:wean wean :near near :far far :link link :real real}))
+
+(t/deftest discovery-by-name
+  (let [{:keys [wean near far link real]} (shadowed)
+        discovers (fn [path]
+                    (let [{:keys [exit out err]}
+                          (bb-eval {"PATH" (str path)}
+                                   (str "(require '[wean :as w])"
+                                        "(prn (some-> (#'w/discover \"" link "\") str))"))]
+
+                      (t/is (zero? exit) err)
+                      (edn/read-string out)))]
+
+    (t/testing "the binary that wean's own symlink shadows is found"
+      (t/is (= real (discovers (str near ":" far)))))
+
+    (t/testing "wean is skipped however often it appears"
+      (let [also (fs/path *dir* "also")]
+        (fs/create-dirs also)
+        (fs/create-sym-link (fs/path also "claude") wean)
+        (t/is (= real (discovers (str near ":" also ":" far))))))
+
+    (t/testing "nothing is found when wean is the only candidate"
+      (t/is (nil? (discovers near))))))
+
+(t/deftest target-resolution
+  (let [{:keys [near far link real]} (shadowed)
+        code (str "(require '[wean :as w])"
+                  "(prn (#'w/target \"" link "\"))")]
+
+    (t/testing "discovery supplies the binary when nothing else does"
+      (t/is (= real (edn/read-string (:out (bb-eval {"PATH" (str near ":" far)} code))))))
+
+    (t/testing "WEAN_BINARY takes precedence over anything on PATH"
+      (t/is (= "/elsewhere/claude"
+               (edn/read-string (:out (bb-eval {"PATH"        (str near ":" far)
+                                                "WEAN_BINARY" "/elsewhere/claude"}
+                                               code))))))
+
+    (t/testing "failing to resolve exits non-zero rather than running nothing"
+      ; The empty string is truthy in Clojure, so an empty result must
+      ; not be allowed to pass for an answer.
+      (let [{:keys [exit err]} (bb-eval {"PATH" (str near)} code)]
+        (t/is (= 1 exit))
+        (t/is (re-find #"claude" err))))))
