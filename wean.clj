@@ -1,16 +1,32 @@
 #!/usr/bin/env bb
 
-; TODO Namespace-level docstring
+;; wean: Seize the means of production from our agentic overlords ;;;;;;
+; Copyright (C) 2026 Christopher Harrison
 
-;; Log format ($XDG_STATE_HOME/wean/log.edn):
-;; ```clojure
-;; {"<BINARY>"
-;;  [{:id <UUID> :pid <WEAN PID> :start <INST>
-;;                               :end <INST>   ; optional
-;;                               :seen <INST>} ; heatbeat of running session(s)
-;;   ...]
-;;  ...}
-;; ```
+; Log format ($XDG_STATE_HOME/wean/log.edn):
+; ```edn
+; {"<BINARY>"
+;  [{:id    <UUID>      ; unique session ID
+;    :pid   <WEAN PID>  ; the process wean is supervising
+;    :start <INST>      ; when the session began
+;    :end   <INST>      ; when the session ended (optional)
+;    :seen  <INST>}     ; last heartbeat of a running session
+;   ...]
+;  ...}
+; ```
+
+; This program is free software: you can redistribute it and/or modify
+; it under the terms of the GNU General Public License as published by
+; the Free Software Foundation, either version 3 of the License, or (at
+; your option) any later version.
+;
+; This program is distributed in the hope that it will be useful, but
+; WITHOUT ANY WARRANTY; without even the implied warranty of
+; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+; General Public License for more details.
+;
+; You should have received a copy of the GNU General Public License
+; along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 (ns wean)
 

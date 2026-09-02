@@ -5,4 +5,7 @@
         :requires ([clojure.test :as t]
                    [wean-test])
         :task (let [{:keys [fail error]} (t/run-tests 'wean-test)]
-                (System/exit (if (pos? (+ fail error)) 1 0)))}}}
+                (System/exit (if (pos? (+ fail error)) 1 0)))}}
+
+ :aliases
+ {:neil {:project {:version "0.2.0"}}}}
