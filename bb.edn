@@ -1,0 +1,15 @@
+{:paths ["."]
+
+ :tasks
+ {test {:doc "Run the unit tests."
+        :requires ([clojure.test :as t]
+                   [wean-test])
+        :task (let [{:keys [fail error]} (t/run-tests 'wean-test)]
+                (System/exit (if (pos? (+ fail error)) 1 0)))}
+
+  plot {:doc "Regenerate the README's plots."
+        :requires ([plot])
+        :task (plot/generate!)}}
+
+ :aliases
+ {:neil {:project {:version "0.2.0"}}}}
