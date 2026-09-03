@@ -15,7 +15,7 @@
 
       # Everything the QA tasks operate on, so that the checks and the
       # formatter cannot drift apart over which files they cover.
-      clojure = "wean.clj wean_test.clj bb.edn";
+      clojure = "wean.clj wean_test.clj plot.clj bb.edn";
       nix = "flake.nix wean.nix";
 
       # A QA check: run the script against a writeable copy of the
