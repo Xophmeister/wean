@@ -38,9 +38,16 @@
 ;; Constants ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ; TODO Make these configurable
-(def ^:const default-retention  (* 30 24 60 60 1000)) ; 30 day
-(def ^:const default-window     (* 24 60 60 1000))    ; 24 hours
+(def ^:const default-retention  (* 30 24 60 60 1000)) ; 30 days
+(def ^:const default-window     (* 7 24 60 60 1000))  ; 1 week
 (def ^:const heartbeat-interval 60000)                ; 1 minute
+(def ^:const session-equivalent (* 30 60 1000))       ; 30 minutes
+(def ^:const max-friction       1200)                 ; 20 minutes
+
+; The friction curve is pinned by two opinions rather than by its own
+; parameters: [score seconds] pairs saying what a light week and a heavy
+; one ought to cost. Its steepness and midpoint fall out of them.
+(def ^:const friction-anchors [[10 10] [50 120]])
 
 ; Also: State path override, rather than relying on XDG_STATE_HOME
 
@@ -48,44 +55,70 @@
 ; What can be gleaned from the log: the sessions that bear on a decision,
 ; what they add up to and the friction they incur.
 
-(defn sessions-in-window
-  "Returns all sessions for the given binary that overlap the window of
-  the given width, ending now. Deliberately a superset: a session that
-  began before the window may still have run inside it and one with no
-  :end is still running."
-  [log binary now window]
+(defn sessions-for
+  "Returns all sessions for the given binary."
+  [log binary]
 
-  (let [window-start (- now window)]
-    (->> (get log binary)
-         (filter #(> (or (:end %) now) window-start))
-         vec)))
+  (into [] (get log binary)))
 
 (defn usage
-  "Counts sessions started within the window and sums the time actually
-  spent inside it. The two use different predicates on purpose: a
-  session that began before the window isn't a launch within it, but
-  whatever part of it fell inside the window is still time spent."
+  "Weighs a binary's sessions by age, so that recent use counts for more
+  than old. Weight decays exponentially with a mean lifetime of one
+  window -- a half-life of window * ln 2, or a little under five days
+  at a week -- so nothing is excluded outright and there is no cliff to
+  sit out.
+
+  The two terms are weighed differently on purpose: a launch is an
+  instant and takes the weight of its moment, whereas time spent is a
+  span and is integrated across the session, discounting its older part
+  against its newer. Both are therefore fractional and time spent
+  remains in milliseconds. A session left running converges on one
+  window's worth, which is what bounds the cost of never closing one."
   [sessions now window]
 
-  (let [window-start (- now window)]
+  (let [weight (fn [t] (Math/exp (/ (- (min t now) now) window)))]
     (reduce (fn [{:keys [count duration]} {:keys [start end]}]
-              (let [end (or end now)
-                    overlap (max 0 (- (min end now)
-                                      (max start window-start)))]
+              (let [w-start (weight start)
+                    w-end   (weight (max start (or end now)))]
 
-                {:count (if (>= start window-start) (inc count) count)
-                 :duration (+ duration overlap)}))
+                {:count    (+ count w-start)
+                 :duration (+ duration (* window (- w-end w-start)))}))
 
-            {:count 0 :duration 0}
+            {:count 0.0 :duration 0.0}
             sessions)))
 
-(defn friction
-  "Calculate the wait time based on the window usage."
-  ; TODO Take :duration into account too
-  [{:keys [count]}]
+(defn score
+  "Usage as a single figure, trading time spent against launches: a
+  session running for one session-equivalent counts for as much as
+  starting another. Both terms arrive already decayed by age."
+  [{:keys [count duration]}]
 
-  ; Legacy formula: 3 + 2^count
-  (long (+ 3 (Math/pow 2 count))))
+  (+ count (/ duration session-equivalent)))
+
+(def ^:private curve
+  "Steepness and midpoint, solved for from the anchors. Inverting the
+  sigmoid gives ln(f / (max - f)) at each; its gradient in score is the
+  steepness, and the score at which it vanishes is the midpoint."
+  (let [[[u1 f1] [u2 f2]] friction-anchors
+        logit (fn [f] (Math/log (/ f (- max-friction f))))
+        k     (/ (- (logit f2) (logit f1)) (- u2 u1))]
+
+    {:steepness k
+     :midpoint  (- u1 (/ (logit f1) k))}))
+
+(defn friction
+  "The wait a given usage has earned, in seconds. A logistic in the
+  score: mild while usage is ordinary, steep once it is not, and
+  levelling off at max-friction so that the tool stays worth obeying
+  rather than worth deleting."
+  [usage]
+
+  (let [{:keys [steepness midpoint]} curve]
+    ; Rounded rather than truncated: the anchors are transcendental
+    ; round-trips that land a hair below their own target, and taking the
+    ; floor would miss every one of them by a second.
+    (Math/round (/ (double max-friction)
+                   (+ 1 (Math/exp (- (* steepness (- (score usage) midpoint)))))))))
 
 ;; Log ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; Pure operations over the whole log. Anything needing the outside world
@@ -352,7 +385,7 @@
 ; whole foreground process group: were the agent to stop and wean not,
 ; the shell would still be waiting on wean and the terminal would sit
 ; with no prompt. SIGINT and SIGQUIT stay absorbed throughout: they are
-; meant for the agent, which hanles them itself, and wean dying would
+; meant for the agent, which handles them itself, and wean dying would
 ; orphan it and return a prompt while it still held the terminal.
 (def ^:private supervise-signals
   {"TSTP" sun.misc.SignalHandler/SIG_DFL})
@@ -451,7 +484,8 @@
 
     (let [now (System/currentTimeMillis)]
       (-> (read-log path)
-          (sessions-in-window name now default-window)
+          (reap pid-alive?)
+          (sessions-for name)
           (usage now default-window)
           friction
           nag))
