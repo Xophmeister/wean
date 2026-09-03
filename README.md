@@ -93,8 +93,8 @@ earned; a free pass on a schedule you could learn and time your work
 around. Decaying the weight removes the cliff: old sessions never stop
 counting, they just matter less.
 
-`default-window` is therefore a mean lifetime rather than a cut-off. A
-week's window puts the half-life a shade under five days.
+`:window` is therefore a mean lifetime rather than a cut-off. A week's
+window puts the half-life a shade under five days.
 
 Time spent is _integrated_ across a session rather than weighted at its
 start, so the older part of a long session is discounted against its
@@ -108,10 +108,10 @@ The two measurements are traded against each other at a fixed rate and
 added together:
 
 ```
-score = launches + time spent / session-equivalent
+score = launches + time spent / :session-equivalent
 ```
 
-`session-equivalent` (30 minutes) is that rate, and it reads as a
+`:session-equivalent` (30 minutes) is that rate, and it reads as a
 question in English: _how long may a session run before it counts as
 another launch?_
 
@@ -123,6 +123,14 @@ use of the tool for less friction, which is precisely backwards. The
 exchange rate decides which habit comes off worst: set it too generously
 and someone churning through short sessions is punished harder than
 someone who never closes one at all.
+
+Because the cost of leaving a session open is only charged the _next_
+time you start one, wean says what it is weighing as it makes you wait:
+
+```
+Do not overuse this! Use your brain, instead!
+Lately: 6 launches, 9h 11m running, for a score of 25.
+```
 
 Consider the following three habits to make that concrete; each a week's
 worth, at the point where the decay has settled:
@@ -160,24 +168,24 @@ more to pay.
 
 Two constants shape the curve and they do (almost) independent jobs.
 
-`friction-anchors` is a pair of `[score, seconds]` opinions: what a
-light week and a heavy one ought to cost. The steepness and midpoint are
-_solved for_ from them rather than written down, because `0.0645` and
-`84.04` are numbers nobody can sanity-check, whereas "ten seconds after
-a light week" is a judgement you can actually hold. `max-friction` is
-the ceiling.
+`:anchors` is a pair of `[score, seconds]` opinions: what a light week
+and a heavy one ought to cost. The steepness and midpoint are _solved
+for_ from them rather than written down, because `0.0645` and `84.04`
+are numbers nobody can sanity-check, whereas "ten seconds after a light
+week" is a judgement you can actually hold. `:max-friction` is the
+ceiling.
 
 Moving the ceiling barely disturbs the anchored region:
 
-| `max-friction` | Light week | Heavy week | One long session a day |
-| :------------- | :--------- | :--------- | :--------------------- |
-| 10 minutes     | 9 s        | 2 min      | 10 min                 |
-| 20 minutes     | 9 s        | 2 min      | 18 min                 |
-| 30 minutes     | 9 s        | 2 min      | 26 min                 |
+| `:max-friction` | Light week | Heavy week | One long session a day |
+| :-------------- | :--------- | :--------- | :--------------------- |
+| 10 minutes      | 9 s        | 2 min      | 10 min                 |
+| 20 minutes      | 9 s        | 2 min      | 18 min                 |
+| 30 minutes      | 9 s        | 2 min      | 26 min                 |
 
 ...and moving the anchors barely disturbs the ceiling's:
 
-| `friction-anchors`   | Light week | Heavy week | One long session a day |
+| `:anchors`           | Light week | Heavy week | One long session a day |
 | :------------------- | :--------- | :--------- | :--------------------- |
 | `[[10 5] [50 60]]`   | 4 s        | 49 s       | 16 min                 |
 | `[[10 10] [50 120]]` | 9 s        | 2 min      | 18 min                 |
@@ -185,14 +193,68 @@ Moving the ceiling barely disturbs the anchored region:
 
 So the anchors set how the everyday feels and the ceiling sets what the
 worst case costs; you can tune either without upsetting the other.
-Along with `default-window` and `session-equivalent`, they all live in
-one block at the top of `wean.clj`.
+All four are settings, described under [Configuration](#configuration).
+
+## Configuration
+
+wean runs on its defaults with no configuration at all. To change them,
+drop a `wean.edn` in `$XDG_CONFIG_HOME` (usually `~/.config/wean.edn`):
+
+```edn
+{:window   [14 :days]
+ :anchors  [[10 30] [50 300]]
+ :log      "/home/you/.local/state/wean/log.edn"}
+```
+
+Anything you leave out keeps its default, so a file need only name what
+you want to differ.
+
+| Setting               | Default              | What it is                                         |
+| :-------------------- | :------------------- | :------------------------------------------------- |
+| `:window`             | `[7 :days]`          | The decay's mean lifetime                          |
+| `:retention`          | `[30 :days]`         | How long a finished session is kept before pruning |
+| `:heartbeat`          | `[60 :seconds]`      | How often a running session marks itself alive     |
+| `:session-equivalent` | `[30 :minutes]`      | Runtime worth as much as one launch                |
+| `:max-friction`       | `1200`               | The longest possible wait, in seconds              |
+| `:anchors`            | `[[10 10] [50 120]]` | Two `[score seconds]` opinions pinning the curve   |
+| `:log`                | XDG state path       | Where the log lives, if not where it usually would |
+
+Spans of history are given as `[n unit]`, where the unit is one of
+`:ms`, `:seconds`, `:minutes`, `:hours` or `:days`; or as a bare number
+of milliseconds, if you prefer. Waits, being what you actually sit
+through, are always plain seconds.
+
+### System-wide defaults
+
+wean also reads a `wean.edn` from each directory in `$XDG_CONFIG_DIRS`,
+after your own. Yours wins, so a NixOS module can install a policy at
+`/etc/xdg/wean.edn` that you remain free to overrule.
+
+### If you get it wrong
+
+wean refuses to start and says everything that is wrong in one go rather
+than one fault at a time:
+
+```
+wean cannot use its configuration:
+  :windwo is not a setting wean has
+  :retention must be a positive span: milliseconds, or [n unit] with unit one of days, hours, minutes, ms, seconds
+  :anchors must rise, cost more than nothing and stay under :max-friction (1200 s)
+```
+
+Refusing outright is deliberate. The alternative -- shrugging and
+falling back to the defaults -- means a typo can quietly turn wean into
+something that isn't watching you at all, which is exactly the failure
+you would never notice. The anchor rule earns its keep here in
+particular: an anchor at or beyond `:max-friction` has no finite
+logarithm and the wait that falls out of the arithmetic is _zero_.
 
 ## State
 
 wean keeps a log at `$XDG_STATE_HOME/wean/log.edn` -- usually
 `~/.local/state/wean/log.edn` -- with one entry per session per wrapped
-binary, recording when it started and when it ended. Deleting it resets
+binary, recording when it started and when it ended. Set `:log` if you
+would rather it lived elsewhere. Deleting it resets
 the friction to nothing, which segues neatly to...
 
 ## Isn't this trivial to bypass?

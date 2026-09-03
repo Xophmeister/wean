@@ -20,6 +20,11 @@
 ; transaction, so a log of 1970 timestamps deletes itself on first touch.
 (defn recently [ms] (- (System/currentTimeMillis) ms))
 
+(def config
+  "wean's own defaults, which the policy tests are written against. They
+  are already in milliseconds, so they need no resolving."
+  w/defaults)
+
 (def log
   {"claude"
    [{:id :brief    :start (ago (* 50 minute)) :end (ago (* 40 minute))}  ; ran 10m, ended 40m ago
@@ -97,6 +102,13 @@
 (def ^:dynamic *dir* nil)
 (defn- log-path [] (str (fs/path *dir* "log.edn")))
 
+(defn- store
+  "A configuration pointing at this test's own log, so that the
+  persistence layer has somewhere private to write."
+  []
+
+  (assoc config :log (log-path)))
+
 (defn- with-temp-dir [f]
   (let [dir (fs/create-temp-dir {:prefix "wean-test"})]
     (try
@@ -104,6 +116,107 @@
       (finally (fs/delete-tree dir)))))
 
 (t/use-fixtures :each with-temp-dir)
+
+;; Configuration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(t/deftest span-parsing
+  (t/testing "a bare number is already milliseconds"
+    (t/is (= 500 (w/span 500))))
+
+  (t/testing "an [n unit] pair is converted"
+    (t/is (= (* 7 day) (w/span [7 :days])))
+    (t/is (= (* 30 minute) (w/span [30 :minutes])))
+    (t/is (= 250 (w/span [250 :ms]))))
+
+  (t/testing "anything else is nothing, for the vetting to complain about"
+    (t/is (nil? (w/span [7 :fortnights])))
+    (t/is (nil? (w/span "7 days")))
+    (t/is (nil? (w/span [7])))
+    (t/is (nil? (w/span nil)))))
+
+(t/deftest configuration-precedence
+  (t/testing "with nothing found, the defaults stand"
+    (t/is (= w/defaults (w/configure []))))
+
+  (t/testing "a partial file overrides only what it names"
+    (let [merged (w/configure [{:window [1 :days]}])]
+      (t/is (= [1 :days] (:window merged)))
+      (t/is (= (:max-friction w/defaults) (:max-friction merged)))))
+
+  (t/testing "the earlier file wins, being the more particular"
+    ; config-files lists the user's own first, so a system-wide policy
+    ; is something to be overruled rather than something that overrules.
+    (t/is (= [1 :days] (:window (w/configure [{:window [1 :days]}
+                                              {:window [2 :days]}])))))
+
+  (t/testing "spans are reduced once the configuration has settled"
+    (t/is (= (* 7 day)
+             (:window (w/resolved (w/configure [{:window [7 :days]}])))))))
+
+(t/deftest configuration-search-path
+  (t/testing "the user's own configuration comes first"
+    (t/is (= ["/home/me/.config/wean.edn" "/etc/xdg/wean.edn"]
+             (mapv str (w/config-files "/home/me/.config" "/etc/xdg")))))
+
+  (t/testing "every XDG_CONFIG_DIRS entry follows, in the order given"
+    (t/is (= ["/home/me/.config/wean.edn"
+              "/etc/xdg/wean.edn"
+              "/nix/etc/xdg/wean.edn"]
+             (mapv str (w/config-files "/home/me/.config"
+                                       "/etc/xdg:/nix/etc/xdg")))))
+
+  (t/testing "an unset XDG_CONFIG_DIRS falls back to the specified default"
+    (t/is (= ["/home/me/.config/wean.edn" "/etc/xdg/wean.edn"]
+             (mapv str (w/config-files "/home/me/.config" nil))))))
+
+(t/deftest configuration-guards
+  (t/testing "the defaults are themselves acceptable"
+    ; Not a tautology: the vetting is quite capable of disagreeing with
+    ; the values shipped beside it.
+    (t/is (empty? (w/problems w/defaults))))
+
+  (t/testing "a misspelled setting is caught rather than quietly ignored"
+    (t/is (seq (w/problems (w/configure [{:windwo (* 7 day)}])))))
+
+  (t/testing "a span must parse, and must be positive"
+    (t/is (seq (w/problems (w/configure [{:window [7 :fortnights]}]))))
+    (t/is (seq (w/problems (w/configure [{:retention -1}])))))
+
+  (t/testing "anchors must be two well-formed pairs"
+    (t/is (seq (w/problems (w/configure [{:anchors [1 2]}]))))
+    (t/is (seq (w/problems (w/configure [{:anchors [[10 10]]}])))))
+
+  (t/testing "anchors must ascend in score"
+    (t/is (seq (w/problems (w/configure [{:anchors [[50 120] [10 10]]}])))))
+
+  (t/testing "an anchor outside (0, max-friction) is refused"
+    (doseq [anchors [[[10 0] [50 120]]     ; No wait at all
+                     [[10 10] [50 1200]]   ; The ceiling itself
+                     [[10 10] [50 1500]]]] ; Beyond it
+      (t/is (seq (w/problems (w/configure [{:anchors anchors}]))))))
+
+  (t/testing "a log path must be a path"
+    (t/is (seq (w/problems (w/configure [{:log 42}])))))
+
+  (t/testing "every fault is reported at once, not one per attempt"
+    (t/is (< 1 (count (w/problems (w/configure [{:windwo 1 :retention -1}])))))))
+
+(t/deftest failing-wide-open
+  ; What the anchor guard is really for. Outside (0, max-friction) the
+  ; logit is not finite, and the wait that falls out of it is nothing at
+  ; all: wean quietly disabling itself, which is the one direction it
+  ; must never fail in.
+  (t/testing "an anchor beyond the ceiling would earn no wait whatsoever"
+    (t/is (zero? (w/friction (assoc config :anchors [[10 10] [50 1500]])
+                             {:count 500 :duration 0}))))
+
+  (t/testing "an anchor of no wait at all would do the same"
+    (t/is (zero? (w/friction (assoc config :anchors [[10 0] [50 120]])
+                             {:count 500 :duration 0}))))
+
+  (t/testing "and every one of them is refused before it can"
+    (doseq [anchors [[[10 10] [50 1500]] [[10 0] [50 120]] [[10 10] [50 1200]]]]
+      (t/is (seq (w/problems (assoc config :anchors anchors)))))))
 
 ;; Policy ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -218,59 +331,103 @@
 
 (t/deftest exchange-rate
   (t/testing "an unused window scores nothing"
-    (t/is (close? 0.0 (w/score {:count 0.0 :duration 0.0}))))
+    (t/is (close? 0.0 (w/score config {:count 0.0 :duration 0.0}))))
 
   (t/testing "a session-equivalent of runtime counts as another launch"
-    (t/is (close? (w/score {:count 2.0 :duration 0.0})
-                  (w/score {:count 0.0 :duration (* 2 w/session-equivalent)}))))
+    (t/is (close? (w/score config {:count 2.0 :duration 0.0})
+                  (w/score config {:count 0.0 :duration (* 2 (:session-equivalent config))}))))
 
   (t/testing "the two terms simply add"
-    (t/is (close? 3.5 (w/score {:count 3.0 :duration (/ w/session-equivalent 2)}))))
+    (t/is (close? 3.5 (w/score config {:count 3.0 :duration (/ (:session-equivalent config) 2)}))))
 
   (t/testing "leaving one session open outweighs launching another"
     ; The whole point of the change: an eight-hour session is sixteen
     ; session-equivalents, against the one it cost to start.
-    (t/is (< (w/score {:count 2.0 :duration 0.0})
-             (w/score {:count 1.0 :duration (* 8 hour)})))))
+    (t/is (< (w/score config {:count 2.0 :duration 0.0})
+             (w/score config {:count 1.0 :duration (* 8 hour)})))))
 
 (t/deftest friction-curve
   (t/testing "the anchors are met exactly"
     ; They are the two opinions the curve is solved from -- what a light
     ; week and a heavy one ought to cost -- so they must come back whole.
-    (doseq [[usage seconds] w/friction-anchors]
-      (t/is (= seconds (w/friction {:count usage :duration 0})))))
+    (doseq [[usage seconds] (:anchors config)]
+      (t/is (= seconds (w/friction config {:count usage :duration 0})))))
 
   (t/testing "an unused window still costs a few seconds"
-    (t/is (= 5 (w/friction {:count 0 :duration 0}))))
+    (t/is (= 5 (w/friction config {:count 0 :duration 0}))))
 
   (t/testing "the wait never falls as usage rises"
-    (let [waits (mapv #(w/friction {:count % :duration 0}) (range 0 200 5))]
+    (let [waits (mapv #(w/friction config {:count % :duration 0}) (range 0 200 5))]
       (t/is (= waits (vec (sort waits))))
       (t/is (< (first waits) (last waits)))))
 
   (t/testing "the wait levels off at max-friction, however absurd the usage"
     ; Bounded on purpose: a wait long enough to be worth circumventing
     ; buys no deterrence at all, the bypass being a single rm.
-    (t/is (= w/max-friction (w/friction {:count 1000 :duration 0})))
-    (t/is (= w/max-friction (w/friction {:count 1e9 :duration 0}))))
+    (t/is (= (:max-friction config) (w/friction config {:count 1000 :duration 0})))
+    (t/is (= (:max-friction config) (w/friction config {:count 1e9 :duration 0}))))
 
   (t/testing "time spent tells, where once it was ignored"
-    (t/is (< (w/friction {:count 1 :duration 0})
-             (w/friction {:count 1 :duration (* 5 hour)}))))
+    (t/is (< (w/friction config {:count 1 :duration 0})
+             (w/friction config {:count 1 :duration (* 5 hour)}))))
 
   (t/testing "the leave-it-open habit is punished hardest"
     ; A week of each, at steady state: light use, many short sessions,
     ; and one long session a day. The last is what the duration term
     ; exists to catch, and it must come out worst.
-    (let [light   (w/friction {:count 5  :duration (* 5 20 minute)})
-          churner (w/friction {:count 40 :duration (* 40 5 minute)})
-          gamer   (w/friction {:count 7  :duration (* 7 8 hour)})]
+    (let [light   (w/friction config {:count 5  :duration (* 5 20 minute)})
+          churner (w/friction config {:count 40 :duration (* 40 5 minute)})
+          gamer   (w/friction config {:count 7  :duration (* 7 8 hour)})]
 
       (t/is (< light churner gamer))))
 
   (t/testing "the wait is integral, being both formatted and slept on"
     ; (format "%2d" 5.0) throws
-    (t/is (integer? (w/friction {:count 3 :duration 0})))))
+    (t/is (integer? (w/friction config {:count 3 :duration 0})))))
+
+;; Nag UI ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(t/deftest spoken-spans
+  (t/testing "seconds, while that is all there is"
+    (t/is (= "45s" (w/spoken (* 45 1000)))))
+
+  (t/testing "minutes, once there are any"
+    (t/is (= "20m" (w/spoken (* 20 minute)))))
+
+  (t/testing "hours and minutes together"
+    (t/is (= "9h 11m" (w/spoken (+ (* 9 hour) (* 11 minute))))))
+
+  (t/testing "nothing at all still reads as a span"
+    (t/is (= "0s" (w/spoken 0)))))
+
+(t/deftest accounting-for-the-wait
+  ; Time spent is charged the next time round, so a nag that does not
+  ; say what earned it teaches nothing: the one thing the user needs to
+  ; connect is the session they left open to the wait they are sitting
+  ; through now.
+  (let [line (w/summary config {:count 6.3 :duration (+ (* 9 hour) (* 11 minute))})]
+
+    (t/testing "the launches are reported, rounded"
+      (t/is (re-find #"6 launches" line)))
+
+    (t/testing "and counted, a lone one not being 1 launches"
+      (t/is (re-find #"1 launch," (w/summary config {:count 1.0 :duration 0}))))
+
+    (t/testing "so is the time spent, which is the whole point"
+      (t/is (re-find #"9h 11m running" line)))
+
+    (t/testing "and the score, it being what the wait is drawn from"
+      (t/is (re-find #"score of 25" line)))))
+
+(t/deftest drawing-only-on-a-terminal
+  ; The countdown rewrites one line with cursor control. Redirected,
+  ; that lands as escape sequences in somebody's log file, so the wait
+  ; is taken in silence instead.
+  (t/testing "given a terminal, the line is cleared even at zero seconds"
+    (t/is (seq (with-out-str (#'w/countdown 0 true)))))
+
+  (t/testing "without one, nothing is written at all"
+    (t/is (= "" (with-out-str (#'w/countdown 0 false))))))
 
 ;; Log ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -417,35 +574,35 @@
 
 (t/deftest transactions
   (t/testing "the function is applied, and the resulting log returned"
-    (t/is (= {"claude" []} (w/update-log! (log-path) #(assoc % "claude" [])))))
+    (t/is (= {"claude" []} (w/update-log! (store) #(assoc % "claude" [])))))
 
   (t/testing "the result is what a subsequent read sees"
-    (w/update-log! (log-path) #(assoc % "claude" []))
+    (w/update-log! (store) #(assoc % "claude" []))
     (t/is (= {"claude" []} (w/read-log (log-path)))))
 
   (t/testing "the lock lives beside the log, not in it"
-    (w/update-log! (log-path) identity)
+    (w/update-log! (store) identity)
     (t/is (fs/exists? (str (log-path) ".lock")))))
 
 (t/deftest self-healing
   (t/testing "a session abandoned by a dead process is reaped in passing"
     (let [start (recently (* 10 minute))]
       (w/write-log! {"claude" [{:id :orphan :pid (dead-pid) :start start}]} (log-path))
-      (t/is (= start (:end (session (w/update-log! (log-path) identity) :orphan))))))
+      (t/is (= start (:end (session (w/update-log! (store) identity) :orphan))))))
 
   (t/testing "a session whose process still lives is left running"
     (w/write-log! {"claude" [{:id :live :pid (own-pid) :start (recently minute)}]} (log-path))
-    (t/is (nil? (:end (session (w/update-log! (log-path) identity) :live)))))
+    (t/is (nil? (:end (session (w/update-log! (store) identity) :live)))))
 
   (t/testing "a session that ended beyond the retention period is pruned in passing"
     (w/write-log! {"claude" [{:id :ancient :pid 1
                               :start (recently (* 40 day)) :end (recently (* 31 day))}]}
                   (log-path))
-    (t/is (nil? (session (w/update-log! (log-path) identity) :ancient)))))
+    (t/is (nil? (session (w/update-log! (store) identity) :ancient)))))
 
 (t/deftest session-lifecycle
   (let [started (recently (* 5 minute))
-        id      (w/open-session! (log-path) "claude" started)]
+        id      (w/open-session! (store) "claude" started)]
 
     (t/testing "opening returns an ID that identifies a session in the log"
       (t/is (= started (:start (session (w/read-log (log-path)) id)))))
@@ -457,26 +614,26 @@
       (t/is (= (own-pid) (:pid (session (w/read-log (log-path)) id)))))
 
     (t/testing "closing ends the session"
-      (w/close-session! (log-path) id (recently minute))
+      (w/close-session! (store) id (recently minute))
       (t/is (some? (:end (session (w/read-log (log-path)) id)))))
 
     (t/testing "closing twice does not move the end, as the shutdown hook may repeat it"
       (let [ended (:end (session (w/read-log (log-path)) id))]
-        (w/close-session! (log-path) id (System/currentTimeMillis))
+        (w/close-session! (store) id (System/currentTimeMillis))
         (t/is (= ended (:end (session (w/read-log (log-path)) id))))))))
 
 (t/deftest heartbeating
-  (let [id   (w/open-session! (log-path) "claude" (recently (* 5 minute)))
+  (let [id   (w/open-session! (store) "claude" (recently (* 5 minute)))
         beat (recently (* 3 minute))]
 
     (t/testing "a heartbeat is recorded against the running session"
-      (w/touch-session! (log-path) id beat)
+      (w/touch-session! (store) id beat)
       (t/is (= beat (:seen (session (w/read-log (log-path)) id)))))
 
     (t/testing "a heartbeat arriving after the close cannot reopen the session"
-      (w/close-session! (log-path) id (recently minute))
+      (w/close-session! (store) id (recently minute))
       (let [closed (session (w/read-log (log-path)) id)]
-        (w/touch-session! (log-path) id (System/currentTimeMillis))
+        (w/touch-session! (store) id (System/currentTimeMillis))
         (t/is (= closed (session (w/read-log (log-path)) id)))))))
 
 (t/deftest thread-safety
@@ -486,10 +643,10 @@
     ; the process rather than to the thread that took it, so without a
     ; monitor beneath it the second caller gets an
     ; OverlappingFileLockException rather than its turn.
-    ; The path is resolved here rather than in the workers because
+    ; The configuration is built here rather than in the workers because
     ; binding is thread-local: a bare Thread sees *dir*'s root value,
     ; and fs/path quietly turns a nil parent into a relative path.
-    (let [path    (log-path)
+    (let [cfg     (store)
           threads 4
           each    25
           failed  (atom [])
@@ -497,7 +654,7 @@
                            (Thread.
                             (fn []
                               (dotimes [_ each]
-                                (try (w/open-session! path "claude"
+                                (try (w/open-session! cfg "claude"
                                                       (System/currentTimeMillis))
                                      (catch Exception e (swap! failed conj (class e)))))))))]
 
@@ -513,7 +670,8 @@
     ; it guards against cannot be reached from a single process.
     (let [n     8
           code  (str "(require '[wean :as w]) "
-                     "(w/open-session! \"" (log-path) "\" \"claude\" (System/currentTimeMillis))")
+                     "(w/open-session! (assoc w/defaults :log \"" (log-path) "\") "
+                     "\"claude\" (System/currentTimeMillis))")
           procs (doall (repeatedly n #(p/process ["bb" "-e" code])))
           exits (mapv (comp :exit deref) procs)]
 

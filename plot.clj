@@ -94,11 +94,16 @@
 (defn- fy [seconds] (- friction-floor
                        (* (- friction-floor top) (/ (double seconds) seconds-max))))
 
+(def ^:private config
+  "The plots describe wean as shipped, so they are drawn at its
+  defaults."
+  w/defaults)
+
 (defn- waits
   "The wait a bare score earns, in seconds."
   [score]
 
-  (w/friction {:count score :duration 0}))
+  (w/friction config {:count score :duration 0}))
 
 (defn- spoken
   "A wait, in whichever unit reads more naturally."
@@ -121,9 +126,10 @@
                "usage score")
 
         ; The ceiling, and a crosshair on the midpoint
-        (let [midpoint (:midpoint @#'w/curve)]
-          [(line left (fy w/max-friction) right (fy w/max-friction) accent "5 4")
-           (label (- right 4) (- (fy w/max-friction) 8) "max-friction"
+        (let [midpoint (:midpoint (w/curve config))
+              ceiling  (:max-friction config)]
+          [(line left (fy ceiling) right (fy ceiling) accent "5 4")
+           (label (- right 4) (- (fy ceiling) 8) "max-friction"
                   :anchor "end" :size 11 :fill accent)
 
            (line (fx midpoint) friction-floor (fx midpoint) (fy 600) ink "3 3")

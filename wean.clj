@@ -28,28 +28,172 @@
 ; You should have received a copy of the GNU General Public License
 ; along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-(ns wean)
+(ns wean
+  "Wrap an agentic coding tool in a start-up delay that grows with how
+  much it has lately been leant on, counting both how often it was
+  launched and how long it was left running.
+
+  wean supervises the tool rather than exec'ing it -- Babashka has no
+  exec -- so it stays in the process tree for the whole session and can
+  therefore record when that session began and ended.")
 
 (require '[babashka.fs :as fs]
          '[babashka.process :as p]
          '[clojure.edn :as edn]
-         '[clojure.pprint :as pp])
+         '[clojure.pprint :as pp]
+         '[clojure.string :as str])
 
-;; Constants ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defn- die
+  "Complain on stderr and give up."
+  [& lines]
 
-; TODO Make these configurable
-(def ^:const default-retention  (* 30 24 60 60 1000)) ; 30 days
-(def ^:const default-window     (* 7 24 60 60 1000))  ; 1 week
-(def ^:const heartbeat-interval 60000)                ; 1 minute
-(def ^:const session-equivalent (* 30 60 1000))       ; 30 minutes
-(def ^:const max-friction       1200)                 ; 20 minutes
+  (binding [*out* *err*] (run! println lines))
+  (System/exit 1))
+
+;; Configuration ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Every setting wean has and the reading and vetting of the wean.edn
+; that may turn them. Pure and impure are kept together here, because a
+; setting and the checking of it belong side by side.
+
+(def ^:const defaults
+  "Every setting wean has, at its factory value.
+
+  Spans of history are milliseconds and a configuration may give them
+  as either a bare number of those or an [n unit] pair. Waits are plain
+  seconds throughout, being what one actually sits through."
+  {:window             (* 7 24 60 60 1000)   ; The decay's mean lifetime
+   :retention          (* 30 24 60 60 1000)  ; How long a session is kept
+   :heartbeat          (* 60 1000)           ; Between proofs of life
+   :session-equivalent (* 30 60 1000)        ; Runtime worth one launch
+   :max-friction       1200                  ; The longest possible wait
+   :anchors            [[10 10] [50 120]]    ; See below
+   :log                nil})                 ; Defaults to the XDG path
 
 ; The friction curve is pinned by two opinions rather than by its own
 ; parameters: [score seconds] pairs saying what a light week and a heavy
 ; one ought to cost. Its steepness and midpoint fall out of them.
-(def ^:const friction-anchors [[10 10] [50 120]])
 
-; Also: State path override, rather than relying on XDG_STATE_HOME
+(def ^:const spans
+  "The settings measured in milliseconds."
+  [:window :retention :heartbeat :session-equivalent])
+
+(def ^:const units
+  "What a span may be written in, in milliseconds apiece."
+  {:ms 1 :seconds 1000 :minutes 60000 :hours 3600000 :days 86400000})
+
+(defn span
+  "A span in milliseconds, from either a bare number of them or an
+  [n unit] pair; nil from anything else, which the vetting reports."
+  [value]
+
+  (cond
+    (number? value) value
+
+    (and (vector? value)
+         (= 2 (count value))
+         (number? (first value))
+         (contains? units (second value)))
+    (* (first value) (units (second value)))))
+
+(defn problems
+  "Everything wrong with a configuration, as a list of complaints; empty
+  means it is fit to use. Every fault is reported at once, so that
+  correcting a file is not a guessing game one error at a time."
+  [{:keys [max-friction anchors log] :as config}]
+
+  (let [ceiling (when (and (number? max-friction) (pos? max-friction))
+                  max-friction)]
+
+    (concat
+     (for [k (remove (set (keys defaults)) (keys config))]
+       (str k " is not a setting wean has"))
+
+     (for [k spans
+           :when (not (pos? (or (span (get config k)) 0)))]
+       (str k " must be a positive span: milliseconds, or [n unit] with"
+            " unit one of " (str/join ", " (sort (map name (keys units))))))
+
+     (when-not ceiling
+       [":max-friction must be a positive number of seconds"])
+
+     (if-not (and (vector? anchors)
+                  (= 2 (count anchors))
+                  (every? #(and (vector? %) (= 2 (count %)) (every? number? %))
+                          anchors))
+       [":anchors must be two [score seconds] pairs"]
+
+       (let [[[u1 f1] [u2 f2]] anchors]
+         (concat
+          (when-not (< u1 u2)
+            [":anchors must be given in ascending order of score"])
+
+          ; The logit is finite only strictly inside (0, max-friction).
+          ; At the ceiling exactly it divides by zero and throws; at
+          ; nothing, or beyond the ceiling, it gives NaN, which rounds
+          ; to a wait of nothing at all. Failing wide open, in silence,
+          ; is the one direction wean must not fail in.
+          (when (and ceiling (not (< 0 f1 f2 ceiling)))
+            [(str ":anchors must rise, cost more than nothing and stay"
+                  " under :max-friction (" ceiling " s)")]))))
+
+     (when-not (or (nil? log) (string? log))
+       [":log must be a path, given as a string"]))))
+
+(defn configure
+  "wean's defaults, overlaid by the given configurations in ascending
+  order of precedence."
+  [configs]
+
+  (apply merge defaults (reverse configs)))
+
+(defn resolved
+  "A configuration with every span reduced to milliseconds, so that
+  nothing downstream need care how it was written."
+  [config]
+
+  (reduce #(update %1 %2 span) config spans))
+
+(defn config-files
+  "Where a wean.edn may live, in descending order of precedence: the
+  user's own config home first, then each entry of the given
+  XDG_CONFIG_DIRS, so that a system-wide file may set a policy its users
+  can still overrule."
+  [config-home config-dirs]
+
+  (cons (fs/path config-home "wean.edn")
+        (for [dir (str/split (or config-dirs "/etc/xdg") #":")
+              :when (seq dir)]
+          (fs/path dir "wean.edn"))))
+
+(defn- log-file
+  "Where the log lives: as configured, or else the XDG state path."
+  [config]
+
+  (str (or (:log config) (fs/path (fs/xdg-state-home "wean") "log.edn"))))
+
+(defn- configure!
+  "The effective configuration -- the defaults, overlaid by every
+  wean.edn on the search path, with its spans reduced and its log path
+  settled -- or death listing everything wrong with it."
+  []
+
+  (let [read   (fn [path]
+                 (try (edn/read-string (fs/slurp path))
+                      (catch Exception e
+                        (die (str path " is not readable EDN: "
+                                  (ex-message e))))))
+
+        config (configure (mapv read
+                                (filter fs/exists?
+                                        (config-files (fs/xdg-config-home)
+                                                      (System/getenv "XDG_CONFIG_DIRS")))))]
+
+    (when-let [faults (seq (problems config))]
+      (apply die "wean cannot use its configuration:"
+             (map #(str "  " %) faults)))
+
+    (let [effective (resolved config)]
+      (assoc effective :log (log-file effective)))))
 
 ;; Policy ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; What can be gleaned from the log: the sessions that bear on a decision,
@@ -91,15 +235,17 @@
   "Usage as a single figure, trading time spent against launches: a
   session running for one session-equivalent counts for as much as
   starting another. Both terms arrive already decayed by age."
-  [{:keys [count duration]}]
+  [{:keys [session-equivalent]} {:keys [count duration]}]
 
   (+ count (/ duration session-equivalent)))
 
-(def ^:private curve
+(defn curve
   "Steepness and midpoint, solved for from the anchors. Inverting the
   sigmoid gives ln(f / (max - f)) at each; its gradient in score is the
-  steepness, and the score at which it vanishes is the midpoint."
-  (let [[[u1 f1] [u2 f2]] friction-anchors
+  steepness and the score at which it vanishes is the midpoint."
+  [{:keys [max-friction anchors]}]
+
+  (let [[[u1 f1] [u2 f2]] anchors
         logit (fn [f] (Math/log (/ f (- max-friction f))))
         k     (/ (- (logit f2) (logit f1)) (- u2 u1))]
 
@@ -108,17 +254,18 @@
 
 (defn friction
   "The wait a given usage has earned, in seconds. A logistic in the
-  score: mild while usage is ordinary, steep once it is not, and
+  score: mild while usage is ordinary, steep once it is not and
   levelling off at max-friction so that the tool stays worth obeying
   rather than worth deleting."
-  [usage]
+  [config usage]
 
-  (let [{:keys [steepness midpoint]} curve]
+  (let [{:keys [steepness midpoint]} (curve config)]
     ; Rounded rather than truncated: the anchors are transcendental
-    ; round-trips that land a hair below their own target, and taking the
+    ; round-trips that land a hair below their own target and taking the
     ; floor would miss every one of them by a second.
-    (Math/round (/ (double max-friction)
-                   (+ 1 (Math/exp (- (* steepness (- (score usage) midpoint)))))))))
+    (Math/round (/ (double (:max-friction config))
+                   (+ 1 (Math/exp (- (* steepness (- (score config usage)
+                                                     midpoint)))))))))
 
 ;; Log ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ; Pure operations over the whole log. Anything needing the outside world
@@ -285,20 +432,20 @@
   `(with-lock* ~lockfile (fn [] ~@body)))
 
 (defn update-log!
-  "Apply f to the log held in the given file, under an exclusive lock,
-  writing the result back and returning it. Orphaned sessions are reaped
-  and expired ones pruned on the way through, so that the log self-heals
-  on every transaction."
-  [path f]
+  "Apply f to the configured log, under an exclusive lock, writing the
+  result back and returning it. Orphaned sessions are reaped and expired
+  ones pruned on the way through, so that the log self-heals on every
+  transaction."
+  [{:keys [log retention]} f]
 
-  (with-lock (str path ".lock")
-    (let [log (-> (read-log path)
-                  (reap pid-alive?)
-                  (prune (System/currentTimeMillis) default-retention)
-                  f)]
+  (with-lock (str log ".lock")
+    (let [updated (-> (read-log log)
+                      (reap pid-alive?)
+                      (prune (System/currentTimeMillis) retention)
+                      f)]
 
-      (write-log! log path)
-      log)))
+      (write-log! updated log)
+      updated)))
 
 (defn open-session!
   "Record the start of a session for the given binary in the log held in
@@ -306,37 +453,36 @@
   later.
 
   The PID recorded is wean's own, not the agent's: wean supervises the
-  session, so it is wean's death that leaves one unclosed, and its PID
+  session, so it is wean's death that leaves one unclosed and its PID
   that tells a later transaction whether the session was abandoned.
 
   NOTE Call this only once the nag has elapsed, so that a countdown the
   user abandons leaves no trace."
-  [path binary now]
+  [config binary now]
 
   (let [id (random-uuid)]
-    (update-log! path #(open % binary {:id    id
-                                       :pid   (.pid (java.lang.ProcessHandle/current))
-                                       :start now}))
+    (update-log! config #(open % binary {:id    id
+                                         :pid   (.pid (java.lang.ProcessHandle/current))
+                                         :start now}))
     id))
 
 (defn touch-session!
-  "Record that the session with the given ID is still running, in the log
-  held in the given file. Sessions that have already ended are ignored,
-  so a heartbeat arriving after the close cannot reopen one."
-  [path id now]
+  "Record that the session with the given ID is still running. Sessions
+  that have already ended are ignored, so a heartbeat arriving after the
+  close cannot reopen one."
+  [config id now]
 
-  (update-log! path #(touch % id now)))
+  (update-log! config #(touch % id now)))
 
 (defn close-session!
-  "Record the end of the session with the given ID in the log held in the
-  given file.
+  "Record the end of the session with the given ID.
 
   Safe to call more than once, so the ordinary exit path and a shutdown
   hook may both invoke it without the second inflating the recorded
   duration. A session that is no longer in the log is ignored."
-  [path id now]
+  [config id now]
 
-  (update-log! path #(close % id now)))
+  (update-log! config #(close % id now)))
 
 (defn start-heartbeat!
   "Periodically record that the session with the given ID is still
@@ -344,14 +490,14 @@
   than guessing.
 
   A daemon thread, so it can never hold wean open past the session it is
-  tracking, and silent: wean's stderr is the agent's terminal, so a
-  stack trace here would land in the middle of the agent's display."
-  [path id]
+  tracking and silent: wean's stderr is the agent's terminal, so a stack
+  trace here would land in the middle of the agent's display."
+  [config id]
 
   (doto (Thread. (fn []
                    (loop []
-                     (Thread/sleep heartbeat-interval)
-                     (try (touch-session! path id (System/currentTimeMillis))
+                     (Thread/sleep (:heartbeat config))
+                     (try (touch-session! config id (System/currentTimeMillis))
                           (catch Exception _ nil))
                      (recur))))
 
@@ -392,10 +538,15 @@
 
 ;; Nag UI ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(def ^:private terminal?
+  "Whether wean has a terminal to draw on. Without one, colour and cursor
+  control alike are just noise in somebody's log file."
+  (some? (System/console)))
+
 (def ^:private colours
-  "ANSI attributes, empty when stdout is not a terminal so that
-  redirected output stays clean."
-  (when (some? (System/console))
+  "ANSI attributes, empty when there is no terminal so that redirected
+  output stays clean."
+  (when terminal?
     {:bold      "\033[1m"
      :dim       "\033[2m"
      :red       "\033[31m"
@@ -403,27 +554,65 @@
 
 (defn- colour [attribute] (get colours attribute ""))
 
+(defn spoken
+  "A span of milliseconds, in whichever units read most naturally."
+  [ms]
+
+  (let [seconds (long (/ ms 1000))
+        hours   (quot seconds 3600)
+        minutes (rem (quot seconds 60) 60)]
+
+    (cond
+      (pos? hours)   (format "%dh %dm" hours minutes)
+      (pos? minutes) (format "%dm" minutes)
+      :else          (format "%ds" (rem seconds 60)))))
+
+(defn summary
+  "What the wait was earned with, in a line.
+
+  The figures are decayed by age, so they are what wean is weighing
+  rather than a raw tally: a fortnight-old session is in there, but
+  barely. Worth saying at all because the cost of leaving a session open
+  is charged the next time round and a penalty nobody can connect to
+  what caused it teaches nothing."
+  [config usage]
+
+  (let [launches (Math/round (double (:count usage)))]
+    (format "Lately: %d %s, %s running, for a score of %d."
+            launches
+            (if (= 1 launches) "launch" "launches")
+            (spoken (:duration usage))
+            (Math/round (double (score config usage))))))
+
 (defn- countdown
   "Count down the given number of seconds, rewriting a single line in
-  place."
-  [seconds]
+  place. Without a terminal the wait still happens, in silence: cursor
+  control smeared through a redirected log helps nobody."
+  ([seconds] (countdown seconds terminal?))
 
-  (doseq [remaining (range seconds 0 -1)]
-    (print (format "\r\033[K%sPaused: %2d s remaining...%s"
-                   (colour :dim) remaining (colour :reset)))
-    (flush)
-    (Thread/sleep 1000))
+  ([seconds draw?]
+   (if-not draw?
+     (Thread/sleep (* 1000 seconds))
 
-  (print "\r\033[K")
-  (flush))
+     (do (doseq [remaining (range seconds 0 -1)]
+           (print (format "\r\033[K%sPaused: %d s remaining...%s"
+                          (colour :dim) remaining (colour :reset)))
+           (flush)
+           (Thread/sleep 1000))
+
+         (print "\r\033[K")
+         (flush)))))
 
 (defn nag
-  "Scold the user, then pause for the given number of seconds."
-  [seconds]
+  "Scold the user, account for why, then pause for the given number of
+  seconds."
+  [config usage seconds]
 
   (println (str (colour :bold) (colour :red)
                 "Do not overuse this! Use your brain, instead!"
                 (colour :reset)))
+
+  (println (str (colour :dim) (summary config usage) (colour :reset)))
 
   (countdown seconds))
 
@@ -463,47 +652,41 @@
       (some-> (discover me) str)     ; ...otherwise, PATH discovery...
 
       ; ...or die horribly
-      (do (binding [*out* *err*]
-            (println (str "WEAN_BINARY not set, nor "
-                          (fs/file-name me) " found in PATH!")))
-
-          (System/exit 1))))
+      (die (str "WEAN_BINARY not set, nor " (fs/file-name me)
+                " found in PATH!"))))
 
 ;; Entrypoint ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(def ^:private log-file
-  (fs/path (fs/xdg-state-home "wean") "log.edn"))
-
 (defn -main [& args]
-  (let [path   (str log-file)
+  (let [config (configure!)
         binary (target (System/getProperty "babashka.file"))
         name   (fs/file-name binary)]
 
-    (fs/create-dirs (fs/parent path))
+    (fs/create-dirs (fs/parent (:log config)))
     (signals! nag-signals)
 
-    (let [now (System/currentTimeMillis)]
-      (-> (read-log path)
-          (reap pid-alive?)
-          (sessions-for name)
-          (usage now default-window)
-          friction
-          nag))
+    (let [now  (System/currentTimeMillis)
+          used (-> (read-log (:log config))
+                   (reap pid-alive?)
+                   (sessions-for name)
+                   (usage now (:window config)))]
+
+      (nag config used (friction config used)))
 
     (signals! supervise-signals)
 
-    (let [id   (open-session! path name (System/currentTimeMillis))
+    (let [id   (open-session! config name (System/currentTimeMillis))
           proc (spawn binary args)]
 
-      (start-heartbeat! path id)
+      (start-heartbeat! config id)
 
       (.addShutdownHook (Runtime/getRuntime)
                         (Thread. (fn []
                                    (p/destroy-tree proc)
-                                   (close-session! path id (System/currentTimeMillis)))))
+                                   (close-session! config id (System/currentTimeMillis)))))
 
       (let [exit (:exit @proc)]
-        (close-session! path id (System/currentTimeMillis))
+        (close-session! config id (System/currentTimeMillis))
         (System/exit exit)))))
 
 (when (= *file* (System/getProperty "babashka.file"))
