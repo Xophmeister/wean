@@ -264,6 +264,15 @@ circumvent it. The idea is to provide enough friction to make you think
 twice before reaching for agentic AI tools and, hopefully, building a
 habit of re-engaging with your own work.
 
+Ctrl+C is not one of the ways round it, but nor is it meant to be a
+trap. During the countdown it abandons the launch outright: wean exits,
+the agent never starts and nothing is written to the log, so thinking
+better of it costs nothing and is not held against you next time. What
+it cannot do is hurry the wait along, there being no agent on the far
+side of it to hurry towards. Once the agent is running, wean ignores
+Ctrl+C and leaves the agent to answer it, as it is much better placed
+to know what interrupting it should mean.
+
 ## Agent instructions
 
 To try to further the point, I've included an example agent instruction

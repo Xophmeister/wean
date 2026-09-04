@@ -523,18 +523,27 @@
 ; Babashka, SIGINT cannot be restored once ignored. A caught signal is
 ; reset to its default across exec, so the agent starts clean and no
 ; restoration step is needed.
-(def ^:private nag-signals
-  {"INT" absorb "QUIT" absorb "TSTP" absorb})
 
-; SIGTSTP alone changes hands. During the nag, it must not suspend the
-; countdown; while supervising, it must work, because it reaches the
-; whole foreground process group: were the agent to stop and wean not,
-; the shell would still be waiting on wean and the terminal would sit
-; with no prompt. SIGINT and SIGQUIT stay absorbed throughout: they are
-; meant for the agent, which handles them itself, and wean dying would
-; orphan it and return a prompt while it still held the terminal.
+; SIGINT is conspicuously absent here. During the nag no session has
+; been recorded and no agent yet exists, so dying on it costs nothing
+; and orphans nobody: Ctrl+C abandons the launch, as it means anywhere
+; else. Nor can it be used to duck the wait, there being no agent on
+; the far side of it -- so absorbing it would only trap somebody who
+; had changed their mind, which is not a habit worth discouraging.
+(def ^:private nag-signals
+  {"QUIT" absorb "TSTP" absorb})
+
+; Both dispositions that change do so here, in opposite directions.
+; SIGINT must now be absorbed: it reaches the whole foreground process
+; group, so the agent receives it and answers it itself, whereas wean
+; dying on it would orphan the agent and return a prompt while it still
+; held the terminal. SIGTSTP must now work, for the mirror image of
+; that reason: were the agent to stop and wean not, the shell would
+; still be waiting on wean and the terminal would sit with no prompt.
+; SIGQUIT stays absorbed throughout, being the agent's to answer too.
 (def ^:private supervise-signals
-  {"TSTP" sun.misc.SignalHandler/SIG_DFL})
+  {"INT"  absorb
+   "TSTP" sun.misc.SignalHandler/SIG_DFL})
 
 ;; Nag UI ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
