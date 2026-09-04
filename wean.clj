@@ -178,7 +178,7 @@
   []
 
   (let [read   (fn [path]
-                 (try (edn/read-string (fs/slurp path))
+                 (try (edn/read-string (slurp (fs/file path)))
                       (catch Exception e
                         (die (str path " is not readable EDN: "
                                   (ex-message e))))))
@@ -376,7 +376,7 @@
   [path]
 
   (if (fs/exists? path)
-    (decode (edn/read-string (fs/slurp path)))
+    (decode (edn/read-string (slurp (fs/file path))))
     {}))
 
 (defn write-log!
@@ -391,7 +391,7 @@
                                   :suffix ".tmp"})
         data (with-out-str (pp/pprint (encode log)))]
 
-    (fs/spit tmp data)
+    (spit (fs/file tmp) data)
     (fs/move tmp path {:replace-existing true
                        :atomic-move true})))
 
